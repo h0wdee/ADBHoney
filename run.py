@@ -1,4 +1,4 @@
-#!/usr/local/bin/python3.12
+#!/usr/bin/python3.12
 
 import adbhoney
 
