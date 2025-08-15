@@ -1,0 +1,16 @@
+[Unit]
+Description=ADBHoney container
+
+[Install]
+WantedBy=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+[Container]
+Network=host
+Volume=/home/ubuntu/ADBHoney/docker/adbhoney.cfg:/etc/adbhoney.cfg
+Volume=/home/ubuntu/ADBHoney/docker/dl:/ADBHoney/dl
+Volume=/home/ubuntu/ADBHoney/docker/logs/ADBHoney/logs
+Image=adbhoney:latest
